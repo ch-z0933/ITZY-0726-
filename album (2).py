@@ -32,7 +32,8 @@ except Exception as e:
 st.set_page_config(page_title="ITZY 1:1 畫室活動監控", layout="wide")
 st.title("🎨 ITZY 1:1 畫室活動 in Taipei")
 
-API_URL = "https://www.kmonstar.com.tw/products/%E6%87%89%E5%8B%9F-260726-itzy-motto-11-%E7%95%AB%E5%AE%A4%E6%B4%BB%E5%8B%95-in-taipei.json"
+TW_API = "https://www.kmonstar.com.tw/products/%E6%87%89%E5%8B%9F-260726-itzy-motto-11-%E7%95%AB%E5%AE%A4%E6%B4%BB%E5%8B%95-in-taipei.json"
+INTL_API = "https://kmonstar.com/api/v1/event/detail/f713990a-b532-4867-95a0-83f8471d88df"
 
 TARGET_MEMBERS = [
     "예지 YEJI",
@@ -41,6 +42,19 @@ TARGET_MEMBERS = [
     "채령 CHAERYEONG",
     "유나 YUNA"
 ]
+
+NAME_MAP = {
+    "예지 YEJI": "예지 YEJI",
+    "리아 LIA": "리아 LIA",
+    "류진 RYUJIN": "류진 RYUJIN",
+    "채령 CHAERYEONG": "채령 CHAERYEONG",
+    "유나 YUNA": "유나 YUNA",
+    "YEJI": "예지 YEJI",
+    "LIA": "리아 LIA",
+    "RYUJIN": "류진 RYUJIN",
+    "CHAERYEONG": "채령 CHAERYEONG",
+    "YUNA": "유나 YUNA",
+}
 
 LOG_COLUMNS = ["時間", "張數", "來源", "總銷售量"]
 
@@ -52,6 +66,12 @@ if "member_logs" not in st.session_state:
 
 if "last_totals" not in st.session_state:
     st.session_state.last_totals = {}
+
+if "last_tw_totals" not in st.session_state:
+    st.session_state.last_tw_totals = {}
+
+if "last_intl_totals" not in st.session_state:
+    st.session_state.last_intl_totals = {}
 
 if "bootstrapped" not in st.session_state:
     st.session_state.bootstrapped = False
@@ -75,20 +95,14 @@ def ensure_worksheet(name):
             return None
 
 def sync_from_cloud(names):
-    if not gc:
-        for name in names:
-            if name not in st.session_state.member_logs:
-                st.session_state.member_logs[name] = pd.DataFrame(columns=LOG_COLUMNS)
-        return
-
     for name in names:
+        if not gc:
+            st.session_state.member_logs[name] = pd.DataFrame(columns=LOG_COLUMNS)
+            continue
+
         if name not in st.session_state.member_logs or st.session_state.member_logs[name].empty:
             try:
                 wks = ensure_worksheet(name)
-                if wks is None:
-                    st.session_state.member_logs[name] = pd.DataFrame(columns=LOG_COLUMNS)
-                    continue
-
                 values = wks.get_all_values()
 
                 if not values:
@@ -108,8 +122,8 @@ def sync_from_cloud(names):
                 df = pd.DataFrame(values[1:], columns=values[0])
                 df["張數"] = pd.to_numeric(df["張數"], errors="coerce").fillna(0).astype(int)
                 df["總銷售量"] = pd.to_numeric(df["總銷售量"], errors="coerce").fillna(0).astype(int)
-
                 df = df.iloc[::-1].reset_index(drop=True)
+
                 st.session_state.member_logs[name] = df
 
             except Exception as e:
@@ -117,10 +131,10 @@ def sync_from_cloud(names):
                 st.session_state.member_logs[name] = pd.DataFrame(columns=LOG_COLUMNS)
 
 # =========================
-# 5. API 抓取
+# 5. 台灣版 API
 # =========================
-def get_itzy_data(session):
-    result = {}
+def get_tw_data(session):
+    tw_data = {}
 
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -129,38 +143,67 @@ def get_itzy_data(session):
     }
 
     try:
-        res = session.get(
-            f"{API_URL}?t={int(time.time())}",
-            headers=headers,
-            timeout=10
-        )
+        res = session.get(f"{TW_API}?t={int(time.time())}", headers=headers, timeout=10)
         res.raise_for_status()
         data = res.json()
 
         for v in data.get("variants", []):
             name = (v.get("option1") or "").strip()
+            name = NAME_MAP.get(name, name)
 
             if name in TARGET_MEMBERS:
-                inventory_qty = v.get("inventory_quantity", 0)
-
-                # KMONSTAR 這次是：
-                # 0  = 尚未賣出
-                # -1 = 賣出 1 張
-                # -20 = 賣出 20 張
-                sold = max(0, -int(inventory_qty))
-
-                result[name] = result.get(name, 0) + sold
+                inventory_qty = int(v.get("inventory_quantity", 0))
+                sold = max(0, -inventory_qty)
+                tw_data[name] = tw_data.get(name, 0) + sold
 
     except Exception as e:
-        st.sidebar.error(f"ITZY API 抓取失敗: {e}")
+        st.sidebar.error(f"台灣 API 抓取失敗: {e}")
 
     for member in TARGET_MEMBERS:
-        result.setdefault(member, 0)
+        tw_data.setdefault(member, 0)
 
-    return result
+    return tw_data
 
 # =========================
-# 6. 寫入 Google Sheet
+# 6. 國際版 API
+# =========================
+def get_intl_data(session):
+    intl_data = {}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://kmonstar.com/",
+        "Origin": "https://kmonstar.com",
+    }
+
+    try:
+        res = session.get(f"{INTL_API}?t={int(time.time())}", headers=headers, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+
+        options = data.get("data", {}).get("optionList", [])
+
+        for o in options:
+            name = (o.get("optionNameValue1") or "").strip()
+            name = NAME_MAP.get(name, name)
+
+            stock_ko = o.get("stockKo", {}).get("quantity")
+
+            if name in TARGET_MEMBERS and stock_ko is not None:
+                sold = 1000 - int(stock_ko)
+                intl_data[name] = intl_data.get(name, 0) + sold
+
+    except Exception as e:
+        st.sidebar.error(f"國際 API 抓取失敗: {e}")
+
+    for member in TARGET_MEMBERS:
+        intl_data.setdefault(member, 0)
+
+    return intl_data
+
+# =========================
+# 7. 寫入 Google Sheet
 # =========================
 def append_sale_log(name, now_str, diff, source, total_now):
     if not gc:
@@ -168,9 +211,6 @@ def append_sale_log(name, now_str, diff, source, total_now):
 
     try:
         wks = ensure_worksheet(name)
-        if wks is None:
-            return False
-
         wks.append_row([now_str, int(diff), source, int(total_now)])
         return True
     except Exception as e:
@@ -186,9 +226,6 @@ def build_rank_df(log_df):
 
     positives = rank_df[rank_df["張數"] > 0].copy().reset_index(drop=True)
     negatives = rank_df[rank_df["張數"] < 0].copy().reset_index(drop=True)
-
-    if positives.empty:
-        return pd.DataFrame(columns=["張數", "來源"])
 
     kept_rows = positives.to_dict("records")
 
@@ -214,118 +251,218 @@ def build_rank_df(log_df):
     return final_rank_df
 
 # =========================
-# 7. 主流程
+# 8. 主流程
 # =========================
 status_placeholder = st.empty()
 
 session = requests.Session()
-itzy_res = get_itzy_data(session)
+
+tw_res = get_tw_data(session)
+intl_res = get_intl_data(session)
 
 all_names = TARGET_MEMBERS.copy()
 sync_from_cloud(all_names)
 
-tz = pytz.timezone("Asia/Taipei")
+tz = pytz.timezone('Asia/Taipei')
 now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 for name in all_names:
-    total_now = int(itzy_res.get(name, 0))
 
-    log_df = st.session_state.member_logs.get(name, pd.DataFrame(columns=LOG_COLUMNS))
+    tw_now = int(tw_res.get(name, 0))
+    intl_now = int(intl_res.get(name, 0))
+    total_now = tw_now + intl_now
+
+    log_df = st.session_state.member_logs.get(
+        name,
+        pd.DataFrame(columns=LOG_COLUMNS)
+    )
 
     last_total_in_sheet = 0
+
     if not log_df.empty and "總銷售量" in log_df.columns:
-        last_total_in_sheet = int(pd.to_numeric(
-            pd.Series([log_df.iloc[0]["總銷售量"]]),
-            errors="coerce"
-        ).fillna(0).iloc[0])
+        last_total_in_sheet = int(
+            pd.to_numeric(
+                pd.Series([log_df.iloc[0]["總銷售量"]]),
+                errors="coerce"
+            ).fillna(0).iloc[0]
+        )
 
     diff = total_now - last_total_in_sheet
 
-    # 第一次啟動且 sheet 為空時，不補舊單，只建立基準
+    # 第一次啟動只建立基準，不補舊單
     if not st.session_state.bootstrapped and last_total_in_sheet == 0:
         st.session_state.last_totals[name] = total_now
+        st.session_state.last_tw_totals[name] = tw_now
+        st.session_state.last_intl_totals[name] = intl_now
         continue
 
     if diff != 0:
-        if diff > 0:
-            source = f"新增 +{diff}"
-        else:
-            source = f"退單 {abs(diff)}"
 
-        ok = append_sale_log(name, now, diff, source, total_now)
+        prev_tw = st.session_state.last_tw_totals.get(name, tw_now)
+        prev_intl = st.session_state.last_intl_totals.get(name, intl_now)
 
-        if ok:
-            new_entry = pd.DataFrame([{
-                "時間": now,
-                "張數": int(diff),
-                "來源": source,
-                "總銷售量": int(total_now)
-            }])
+        tw_delta = tw_now - prev_tw
+        intl_delta = intl_now - prev_intl
 
-            st.session_state.member_logs[name] = pd.concat(
-                [new_entry, log_df],
-                ignore_index=True
+        entries = []
+
+        if tw_delta != 0:
+            entries.append({
+                "diff": tw_delta,
+                "source": (
+                    f"TW+{tw_delta}"
+                    if tw_delta > 0
+                    else f"TW退{abs(tw_delta)}"
+                )
+            })
+
+        if intl_delta != 0:
+            entries.append({
+                "diff": intl_delta,
+                "source": (
+                    f"INTL+{intl_delta}"
+                    if intl_delta > 0
+                    else f"INTL退{abs(intl_delta)}"
+                )
+            })
+
+        if not entries:
+            entries.append({
+                "diff": diff,
+                "source": (
+                    "合計變動"
+                    if diff > 0
+                    else "合計退單"
+                )
+            })
+
+        for entry in entries:
+
+            ok = append_sale_log(
+                name,
+                now,
+                entry["diff"],
+                entry["source"],
+                total_now
             )
 
+            if ok:
+
+                new_entry = pd.DataFrame([{
+                    "時間": now,
+                    "張數": int(entry["diff"]),
+                    "來源": entry["source"],
+                    "總銷售量": int(total_now)
+                }])
+
+                st.session_state.member_logs[name] = pd.concat(
+                    [new_entry, log_df],
+                    ignore_index=True
+                )
+
+                log_df = st.session_state.member_logs[name]
+
     st.session_state.last_totals[name] = total_now
+    st.session_state.last_tw_totals[name] = tw_now
+    st.session_state.last_intl_totals[name] = intl_now
 
 st.session_state.bootstrapped = True
 
 # =========================
-# 8. 畫面顯示
+# 9. 畫面顯示
 # =========================
 with status_placeholder.container():
+
     st.write("### 👥 5位成員總銷量統計")
 
     summary = []
+
     for n in all_names:
-        total = int(itzy_res.get(n, 0))
+
+        tw = int(tw_res.get(n, 0))
+        intl = int(intl_res.get(n, 0))
+        total = tw + intl
 
         summary.append({
             "成員名稱": n,
+            "台灣版": tw,
+            "國際版": intl,
             "總計": total
         })
 
-    summary_df = pd.DataFrame(summary).sort_values("總計", ascending=False).reset_index(drop=True)
+    summary_df = (
+        pd.DataFrame(summary)
+        .sort_values("總計", ascending=False)
+        .reset_index(drop=True)
+    )
+
     st.table(summary_df)
 
     st.divider()
 
     tabs = st.tabs(all_names)
+
     for i, tab in enumerate(tabs):
+
         m_name = all_names[i]
 
         with tab:
-            log_df = st.session_state.member_logs.get(m_name, pd.DataFrame(columns=LOG_COLUMNS))
+
+            log_df = st.session_state.member_logs.get(
+                m_name,
+                pd.DataFrame(columns=LOG_COLUMNS)
+            )
 
             cl, cr = st.columns(2)
 
             with cl:
+
                 st.write("🕒 **銷售時間紀錄**")
+
                 if not log_df.empty:
+
                     st.dataframe(
-                        log_df[["時間", "張數", "來源"]],
+                        log_df[
+                            ["時間", "張數", "來源"]
+                        ],
                         width="stretch",
                         hide_index=True
                     )
+
                 else:
+
                     st.info("目前沒有紀錄")
 
             with cr:
+
                 st.write("🏆 **單筆排行**")
+
                 final_rank_df = build_rank_df(log_df)
 
                 if not final_rank_df.empty:
+
                     final_rank_df = final_rank_df.reset_index(drop=True)
                     final_rank_df.index = final_rank_df.index + 1
 
                     rank_display = pd.DataFrame({
-                        "排名": [f"第 {idx} 名" for idx in final_rank_df.index],
-                        "單筆張數": final_rank_df["張數"].values,
-                        "來源": final_rank_df["來源"].values
+
+                        "排名": [
+                            f"第 {idx} 名"
+                            for idx in final_rank_df.index
+                        ],
+
+                        "單筆張數":
+                            final_rank_df["張數"].values,
+
+                        "來源":
+                            final_rank_df["來源"].values
+
                     })
+
                     st.table(rank_display)
+
                 else:
+
                     st.info("目前沒有有效排行資料")
 
 st.caption(f"最後更新時間：{now}")
